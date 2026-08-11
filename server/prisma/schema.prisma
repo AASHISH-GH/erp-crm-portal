@@ -1,0 +1,218 @@
+// Mini ERP + CRM Operations Portal — data model
+//
+// Design notes:
+//  - Challan lines store a *snapshot* of the product (name, sku, category, unit price)
+//    so historical documents never change when the product master is edited later.
+//  - Every change to Product.currentStock is mirrored by a StockMovement row, so the
+//    ledger is the auditable source of truth for "why does stock read what it reads".
+//  - DocumentCounter gives gap-free, race-safe document numbers without relying on
+//    "SELECT max(number) + 1", which breaks under concurrent writes.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  SALES
+  WAREHOUSE
+  ACCOUNTS
+}
+
+enum CustomerType {
+  RETAIL
+  WHOLESALE
+  DISTRIBUTOR
+}
+
+enum CustomerStatus {
+  LEAD
+  ACTIVE
+  INACTIVE
+}
+
+enum MovementType {
+  IN
+  OUT
+}
+
+enum ChallanStatus {
+  DRAFT
+  CONFIRMED
+  CANCELLED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         Role
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  customers      Customer[]       @relation("CustomerCreatedBy")
+  followUps      FollowUp[]
+  stockMovements StockMovement[]
+  challans       Challan[]
+
+  @@map("users")
+}
+
+model Customer {
+  id           String         @id @default(uuid())
+  name         String
+  mobile       String
+  email        String?
+  businessName String?        @map("business_name")
+  gstNumber    String?        @map("gst_number")
+  type         CustomerType   @default(RETAIL)
+  address      String?
+  status       CustomerStatus @default(LEAD)
+  followUpDate DateTime?      @map("follow_up_date")
+  notes        String?
+  createdById  String?        @map("created_by_id")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+
+  createdBy User?      @relation("CustomerCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  followUps FollowUp[]
+  challans  Challan[]
+
+  @@index([name])
+  @@index([mobile])
+  @@index([status])
+  @@index([followUpDate])
+  @@map("customers")
+}
+
+// Append-only CRM activity trail. Kept separate from Customer.notes so the timeline
+// of "who said what, when" survives edits to the customer record.
+model FollowUp {
+  id          String    @id @default(uuid())
+  customerId  String    @map("customer_id")
+  note        String
+  nextFollowUp DateTime? @map("next_follow_up")
+  createdById String?   @map("created_by_id")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  customer  Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  createdBy User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([customerId, createdAt])
+  @@map("follow_ups")
+}
+
+model Product {
+  id            String   @id @default(uuid())
+  name          String
+  sku           String   @unique
+  category      String
+  unitPrice     Decimal  @default(0) @map("unit_price") @db.Decimal(12, 2)
+  currentStock  Int      @default(0) @map("current_stock")
+  minStockAlert Int      @default(0) @map("min_stock_alert")
+  location      String   @default("MAIN")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  movements    StockMovement[]
+  challanItems ChallanItem[]
+
+  @@index([name])
+  @@index([category])
+  @@map("products")
+}
+
+model StockMovement {
+  id          String       @id @default(uuid())
+  productId   String       @map("product_id")
+  quantity    Int // always positive; direction is carried by `type`
+  type        MovementType
+  reason      String
+  // Loose reference so a movement can point at a challan (or a future GRN/PO)
+  // without a hard FK per document type.
+  referenceType String?    @map("reference_type")
+  referenceId   String?    @map("reference_id")
+  stockAfter  Int          @map("stock_after")
+  createdById String?      @map("created_by_id")
+  createdAt   DateTime     @default(now()) @map("created_at")
+
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([productId, createdAt])
+  @@index([createdAt])
+  @@map("stock_movements")
+}
+
+model Challan {
+  id            String        @id @default(uuid())
+  challanNumber String        @unique @map("challan_number")
+  customerId    String?       @map("customer_id")
+
+  // Customer snapshot — the challan must print the same way in five years even if
+  // the customer later renames the business or changes GST.
+  customerName         String  @map("customer_name")
+  customerBusinessName String? @map("customer_business_name")
+  customerMobile       String? @map("customer_mobile")
+  customerGstNumber    String? @map("customer_gst_number")
+  customerAddress      String? @map("customer_address")
+
+  status        ChallanStatus @default(DRAFT)
+  totalQuantity Int           @default(0) @map("total_quantity")
+  totalAmount   Decimal       @default(0) @map("total_amount") @db.Decimal(14, 2)
+  notes         String?
+  createdById   String?       @map("created_by_id")
+  confirmedAt   DateTime?     @map("confirmed_at")
+  cancelledAt   DateTime?     @map("cancelled_at")
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  customer  Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  createdBy User?         @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  items     ChallanItem[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([customerId])
+  @@map("challans")
+}
+
+model ChallanItem {
+  id        String  @id @default(uuid())
+  challanId String  @map("challan_id")
+  productId String? @map("product_id")
+
+  // Product snapshot at the moment the line was written.
+  productName     String  @map("product_name")
+  productSku      String  @map("product_sku")
+  productCategory String? @map("product_category")
+  unitPrice       Decimal @map("unit_price") @db.Decimal(12, 2)
+
+  quantity  Int
+  lineTotal Decimal @map("line_total") @db.Decimal(14, 2)
+
+  challan Challan  @relation(fields: [challanId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([challanId])
+  @@map("challan_items")
+}
+
+// One row per document series (e.g. key = "CHALLAN-2026-08"). Incremented inside the
+// same transaction that creates the document, so two concurrent requests can never
+// receive the same number.
+model DocumentCounter {
+  key       String   @id
+  value     Int      @default(0)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("document_counters")
+}
