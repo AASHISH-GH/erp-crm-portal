@@ -156,7 +156,16 @@ A multi-line challan takes one row lock per product. Two challans sharing produc
 
 ### Challan numbers are race-safe
 
-Numbers follow `CH-YYYYMM-0001`, generated from a `document_counters` table incremented inside the same transaction that creates the challan. `SELECT max(number) + 1` would hand two concurrent requests the same number; a counter row serialises them.
+Numbers follow `CH-YYYYMM-0001`, generated from a `document_counters` row incremented inside the same transaction that creates the challan.
+
+The implementation is a raw `INSERT … ON CONFLICT (key) DO UPDATE … RETURNING value` — one atomic statement. Two weaker approaches were tried and rejected:
+
+- `SELECT max(number) + 1` hands two concurrent requests the same number.
+- **Prisma's `upsert()` is also unsafe here.** It compiles to a SELECT followed by an INSERT or UPDATE, so concurrent transactions all read "no row", all attempt the INSERT, and everyone but the winner dies on the primary-key violation. This was not theoretical — it failed 7 of 8 requests in the concurrency test below, and once produced a duplicate challan number. The native upsert fixed it.
+
+**Trade-off, stated honestly:** the counter lock is held until the surrounding transaction commits, so challan creation serialises on that row. That is the price of gap-free sequential numbering, which finance and audit want. A Postgres `SEQUENCE` would be lock-free but leaves gaps on rollback.
+
+Because transactions can now queue on that lock, Prisma's default transaction limits (2s wait, 5s timeout) were too tight and surfaced as `P2028` errors under load. The challan transactions use 15s/30s, and all read-only work — customer lookup, product snapshot preparation — was moved **outside** the transaction so the lock is held for as little time as possible.
 
 ### Stock is only editable through the ledger
 
@@ -238,7 +247,29 @@ curl http://localhost:4000/health
 # {"status":"ok","database":"connected","timestamp":"..."}
 ```
 
-Or import `postman/ERP-CRM-Portal.postman_collection.json`, run **Auth → Login (Admin)** (the token is captured automatically), then run any other folder.
+**Run the full smoke test** — 57 assertions covering every module:
+
+```bash
+bash scripts/smoke-test.sh
+```
+
+```
+== 9. Concurrency: 8 simultaneous confirms of limited stock ==
+  (8 concurrent confirms of 1 unit each, only 3 in stock)
+  PASS  exactly 3 succeeded  ->  3
+  PASS  final stock is 0, never negative  ->  0
+==================================================
+  PASSED: 57      FAILED: 0
+==================================================
+```
+
+It covers all four role logins, the full RBAC matrix (403s for every disallowed combination), validation shapes, pagination and search, the customer follow-up flow, ledger balance arithmetic, the complete challan lifecycle including confirm/cancel stock round-trips, insufficient-stock rejection with rollback, PDF export, and the concurrency guarantee. Fixtures are randomised per run, so it is safe to run repeatedly against the same database. It also runs against a deployed instance:
+
+```bash
+API=https://your-api.onrender.com/api/v1 bash scripts/smoke-test.sh
+```
+
+Alternatively import `postman/ERP-CRM-Portal.postman_collection.json`, run **Auth → Login (Admin)** (the token is captured automatically), then run any other folder.
 
 ### A 60-second tour of the interesting parts
 
@@ -427,7 +458,7 @@ These were not specified in the brief; each is a deliberate decision:
 
 Stated plainly rather than hidden:
 
-1. **No automated test suite.** CI typechecks, migrates, seeds, builds and smoke-tests the API end to end, but there are no unit or integration tests. Given the 48-hour window I prioritised correct concurrency behaviour and breadth of working features; the services are pure functions of `(tx, input)` and were written to be testable, so `applyMovement` and the challan state machine are where I would start with Vitest + Testcontainers.
+1. **No unit test suite.** There is a 57-assertion end-to-end smoke test (`scripts/smoke-test.sh`) that CI runs against a real Postgres, and it caught two genuine concurrency bugs during development. But there are no isolated unit tests. Given the 48-hour window I chose the black-box suite because it exercises the transactional behaviour that actually matters — that is precisely what a mocked unit test would have missed. The services are pure functions of `(tx, input)` and were written to be testable; `applyMovement` and the challan state machine are where I would start with Vitest + Testcontainers.
 2. **Purchase orders and goods receipts are not modelled.** Inbound stock is recorded as a manual IN movement with a free-text reason instead of being tied to a PO document.
 3. **No tax/GST calculation** — see assumption 8.
 4. **The challan builder loads up to 100 customers and 100 products** into its dropdowns. Fine for this dataset; a real catalogue needs a server-side typeahead.

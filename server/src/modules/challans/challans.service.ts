@@ -11,6 +11,18 @@ import type {
   UpdateChallanInput,
 } from './challans.schema';
 
+/**
+ * Challan writes serialise on the document-counter row, so under concurrent load a
+ * transaction can spend real time queueing before it does any work. Prisma's defaults
+ * (2s maxWait, 5s timeout) are too tight for that plus cloud-database round-trips —
+ * they surfaced as P2028 "transaction already closed" under an 8-way concurrent test.
+ *
+ * These limits are generous enough to absorb a burst while still bounding a stuck
+ * transaction. The companion optimisation is keeping read-only work outside the
+ * transaction so the lock is held for as short a time as possible.
+ */
+const TX_OPTIONS = { maxWait: 15_000, timeout: 30_000 } as const;
+
 const challanInclude = {
   items: { orderBy: { productName: 'asc' } },
   customer: { select: { id: true, name: true, businessName: true, mobile: true, status: true } },
@@ -114,12 +126,18 @@ const deductStockForChallan = async (
   }
 };
 
-export const createChallan = async (input: CreateChallanInput, userId: string) =>
-  prisma.$transaction(async (tx) => {
-    const customer = await tx.customer.findUnique({ where: { id: input.customerId } });
-    if (!customer) throw ApiError.notFound('Customer not found');
+export const createChallan = async (input: CreateChallanInput, userId: string) => {
+  // Resolving the customer and building the line snapshots is read-only, so it happens
+  // *before* the transaction opens. Keeping it inside would hold the counter lock for
+  // the duration of several extra round-trips and throttle concurrent challan creation
+  // for no benefit: the snapshot is a deliberate point-in-time copy, and the stock
+  // guarantee comes from the conditional UPDATE, not from these reads.
+  const customer = await prisma.customer.findUnique({ where: { id: input.customerId } });
+  if (!customer) throw ApiError.notFound('Customer not found');
 
-    const { lines, totalQuantity, totalAmount } = await prepareLines(tx, input.items);
+  const { lines, totalQuantity, totalAmount } = await prepareLines(prisma, input.items);
+
+  return prisma.$transaction(async (tx) => {
     const challanNumber = await nextDocumentNumber(tx, 'CH');
 
     const challan = await tx.challan.create({
@@ -150,7 +168,8 @@ export const createChallan = async (input: CreateChallanInput, userId: string) =
     }
 
     return challan;
-  });
+  }, TX_OPTIONS);
+};
 
 export const confirmChallan = async (id: string, userId: string) =>
   prisma.$transaction(async (tx) => {
@@ -192,7 +211,7 @@ export const confirmChallan = async (id: string, userId: string) =>
       data: { status: ChallanStatus.CONFIRMED, confirmedAt: new Date() },
       include: challanInclude,
     });
-  });
+  }, TX_OPTIONS);
 
 export const cancelChallan = async (id: string, reason: string, userId: string) =>
   prisma.$transaction(async (tx) => {
@@ -236,7 +255,7 @@ export const cancelChallan = async (id: string, reason: string, userId: string) 
       },
       include: challanInclude,
     });
-  });
+  }, TX_OPTIONS);
 
 export const updateChallan = async (id: string, input: UpdateChallanInput) =>
   prisma.$transaction(async (tx) => {
@@ -279,7 +298,7 @@ export const updateChallan = async (id: string, input: UpdateChallanInput) =>
     }
 
     return tx.challan.update({ where: { id }, data, include: challanInclude });
-  });
+  }, TX_OPTIONS);
 
 export const listChallans = async (query: ListChallansQuery) => {
   const search = cleanSearch(query.search);
