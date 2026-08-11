@@ -1,0 +1,63 @@
+# Full local stack: Postgres + API + client, all wired together.
+#
+#   docker compose up --build
+#   docker compose exec api npm run seed
+#
+# Frontend: http://localhost:5173   API: http://localhost:4000
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: erp_crm_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: erp_crm
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # The API must not start migrating before Postgres accepts connections.
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d erp_crm']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: erp_crm_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/erp_crm?schema=public
+      JWT_SECRET: local-development-secret-change-me-please
+      JWT_EXPIRES_IN: 12h
+      CORS_ORIGIN: http://localhost:5173
+      SEED_DEFAULT_PASSWORD: Password@123
+    ports:
+      - '4000:4000'
+    command: sh -c "npx prisma migrate deploy && node dist/server.js"
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://localhost:4000
+    container_name: erp_crm_client
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - '5173:80'
+
+volumes:
+  postgres_data:
