@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  server:
+    name: Server — typecheck, migrate, build
+    runs-on: ubuntu-latest
+
+    # A throwaway Postgres so the migration is actually exercised in CI, not just
+    # assumed to work.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: erp_crm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/erp_crm_test?schema=public
+      JWT_SECRET: ci-secret-value-that-is-long-enough
+      NODE_ENV: test
+
+    defaults:
+      run:
+        working-directory: ./server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - run: npm ci
+
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+
+      - name: Seed demo data
+        run: npm run seed
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Smoke-test the API
+        run: |
+          node dist/server.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:4000/health > /dev/null; then break; fi
+            sleep 1
+          done
+          curl -sf http://localhost:4000/health | tee /dev/stderr | grep -q '"status":"ok"'
+          TOKEN=$(curl -sf -X POST http://localhost:4000/api/v1/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"admin@erpcrm.test","password":"Password@123"}' \
+            | node -pe 'JSON.parse(require("fs").readFileSync(0)).data.token')
+          curl -sf http://localhost:4000/api/v1/customers \
+            -H "Authorization: Bearer $TOKEN" | grep -q '"success":true'
+          kill $SERVER_PID
+        env:
+          PORT: 4000
+
+  client:
+    name: Client — typecheck and build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: ./client
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - run: npm ci
+      - run: npm run build
