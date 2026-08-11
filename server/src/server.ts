@@ -4,9 +4,15 @@ import { prisma } from './lib/prisma';
 
 const app = createApp();
 
-const server = app.listen(env.PORT, () => {
+// Bind to 0.0.0.0, not the default. Container platforms (Render, Railway, Fly, ECS)
+// route traffic to the container's external interface; a process listening only on
+// localhost accepts the TCP connection at the edge and then never answers, which
+// presents as a request that hangs rather than a clean error.
+const HOST = '0.0.0.0';
+
+const server = app.listen(env.PORT, HOST, () => {
   // eslint-disable-next-line no-console
-  console.log(`API listening on http://localhost:${env.PORT} [${env.NODE_ENV}]`);
+  console.log(`API listening on ${HOST}:${env.PORT} [${env.NODE_ENV}]`);
 });
 
 // Close in-flight requests and release the DB pool before the platform SIGKILLs us,
