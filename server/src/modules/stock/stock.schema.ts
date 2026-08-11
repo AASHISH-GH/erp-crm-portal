@@ -1,6 +1,6 @@
 import { MovementType } from '@prisma/client';
 import { z } from 'zod';
-import { paginationSchema } from '../../lib/pagination';
+import { inclusiveEndDate, paginationSchema } from '../../lib/pagination';
 
 export const createMovementSchema = z.object({
   productId: z.string().uuid('A valid product id is required'),
@@ -16,7 +16,7 @@ export const listMovementsSchema = paginationSchema.extend({
   type: z.nativeEnum(MovementType).optional(),
   search: z.string().optional(),
   from: z.coerce.date().optional(),
-  to: z.coerce.date().optional(),
+  to: inclusiveEndDate.optional(),
 });
 
 export type CreateMovementInput = z.infer<typeof createMovementSchema>;

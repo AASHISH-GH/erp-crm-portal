@@ -32,7 +32,7 @@ const NAV: Array<{ section: string; items: NavItem[] }> = [
   },
   {
     section: 'Administration',
-    items: [{ to: '/users', label: 'Users', icon: '⚙' }],
+    items: [{ to: '/users', label: 'Users', icon: '⚙', roles: ['ADMIN'] }],
   },
 ];
 

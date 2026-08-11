@@ -164,6 +164,19 @@ export const confirmChallan = async (id: string, userId: string) =>
       throw ApiError.conflict('A cancelled challan cannot be confirmed');
     }
 
+    // A line whose product was deleted has a null productId (onDelete: SetNull). Its
+    // snapshot still prints correctly, but there is no stock to deduct, so confirming
+    // would silently ship goods the ledger never accounts for. Refuse instead.
+    const orphanedLines = challan.items.filter((item) => item.productId === null);
+    if (orphanedLines.length > 0) {
+      throw ApiError.unprocessable(
+        `Cannot confirm: ${orphanedLines
+          .map((item) => item.productSku)
+          .join(', ')} no longer exist in the product master. Cancel this challan and raise a new one.`,
+        'PRODUCT_DELETED',
+      );
+    }
+
     await deductStockForChallan(
       tx,
       {

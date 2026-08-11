@@ -1,6 +1,6 @@
 import { ChallanStatus } from '@prisma/client';
 import { z } from 'zod';
-import { paginationSchema } from '../../lib/pagination';
+import { inclusiveEndDate, paginationSchema } from '../../lib/pagination';
 
 const challanItemSchema = z.object({
   productId: z.string().uuid('A valid product id is required'),
@@ -44,7 +44,7 @@ export const listChallansSchema = paginationSchema.extend({
   status: z.nativeEnum(ChallanStatus).optional(),
   customerId: z.string().uuid().optional(),
   from: z.coerce.date().optional(),
-  to: z.coerce.date().optional(),
+  to: inclusiveEndDate.optional(),
   sortBy: z.enum(['createdAt', 'challanNumber', 'totalAmount']).default('createdAt'),
   sortOrder: z.enum(['asc', 'desc']).default('desc'),
 });
